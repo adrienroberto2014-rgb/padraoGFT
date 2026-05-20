@@ -1,0 +1,193 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // Phase 3: Primitives & Global Helpers
+    // ===============================================================
+    function isSignedIn() { return request.auth != null; }
+    function isVerified() { return isSignedIn() && request.auth.token.email_verified == true; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    
+    // Super Admin list based on emails from original rules
+    function isSuperAdmin() {
+      return isSignedIn() && request.auth.token.email.lower() in [
+        "rodrigues.ueslei@gmail.com",
+        "rodrigues.ueslei02@gmail.com",
+        "ueslei.rodrigues@gmail.com",
+        "adrienroberto2014@gmail.com" // Added user's email
+      ];
+    }
+
+    // Get current user profile
+    function getUser() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function hasUserDoc() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function userTenantId() {
+      return getUser().get('tenantId', 'default_gym');
+    }
+
+    function userRole() {
+      return getUser().get('role', 'user');
+    }
+
+    function isTenantAdmin() {
+      return isSuperAdmin() || (isVerified() && hasUserDoc() && userRole() in ['admin', 'tenant_admin']);
+    }
+
+    function isTenantStaff() {
+      return isSuperAdmin() || (isVerified() && hasUserDoc() && userRole() in ['admin', 'tenant_admin', 'receptionist', 'professor']);
+    }
+
+    function isProfessor() {
+      return isSuperAdmin() || (isVerified() && hasUserDoc() && userRole() == 'professor');
+    }
+
+    function belongsToUserTenant(data) {
+      return isSuperAdmin() || (isVerified() && hasUserDoc() && data.get('tenantId', '') == userTenantId());
+    }
+
+    // ===============================================================
+    // Validation Blueprints (Pillar 2)
+    // ===============================================================
+    
+    function isValidStudent(data) {
+      return data.keys().hasAll(['name', 'email', 'belt', 'status', 'category', 'tenantId']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 200 &&
+             data.email is string && data.email.size() <= 200 &&
+             data.belt is string &&
+             data.status in ["Active", "Inactive", "Archived"] &&
+             data.category in ["Adulto", "Kids", "Juvenil"] &&
+             data.tenantId is string;
+    }
+
+    function isValidClass(data) {
+      return data.keys().hasAll(['title', 'startTime', 'endTime', 'tenantId']) &&
+             data.title is string && data.title.size() <= 200 &&
+             data.startTime is string && data.endTime is string &&
+             data.tenantId is string;
+    }
+
+    function isValidPayment(data) {
+      return data.keys().hasAll(['studentId', 'amount', 'date', 'period', 'tenantId']) &&
+             data.studentId is string &&
+             data.amount is number && data.amount >= 0 &&
+             data.date is string &&
+             data.period is string &&
+             data.tenantId is string;
+    }
+
+    function isValidGraduation(data) {
+      return data.keys().hasAll(['studentId', 'belt', 'stripes', 'date', 'tenantId']) &&
+             data.studentId is string &&
+             data.belt in ["White", "Blue", "Purple", "Brown", "Black"] &&
+             data.stripes is number && data.stripes >= 0 && data.stripes <= 4 &&
+             data.date is string &&
+             data.tenantId is string;
+    }
+
+    function isValidInvoice(data) {
+      return data.keys().hasAll(['studentId', 'amount', 'dueDate', 'status', 'tenantId']) &&
+             data.studentId is string &&
+             data.amount is number &&
+             data.dueDate is string &&
+             data.status in ["Open", "Paid", "Void", "Uncollectible", "Draft"] &&
+             data.tenantId is string;
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['name', 'email', 'role', 'tenantId']) &&
+             data.name is string && data.email is string &&
+             data.role is string && data.tenantId is string;
+    }
+
+    // ===============================================================
+    // Collection Matches
+    // ===============================================================
+
+    // 1. Tenants
+    match /tenants/{tenantId} {
+      allow read: if isVerified() && (isSuperAdmin() || tenantId == userTenantId());
+      allow write: if isSuperAdmin();
+    }
+
+    // 2. Users (RBAC & Profiles)
+    match /users/{userId} {
+      allow get: if isVerified() && (isSuperAdmin() || request.auth.uid == userId || isTenantStaff());
+      allow list: if isVerified() && (isSuperAdmin() || isTenantStaff());
+      allow create: if isVerified() && (request.auth.uid == userId);
+      allow update: if isSuperAdmin() || (
+        isVerified() && request.auth.uid == userId && 
+        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'email'])
+      ) || (
+        isTenantAdmin() && belongsToUserTenant(existing()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['role', 'approved'])
+      );
+      allow delete: if isSuperAdmin();
+    }
+
+    // 3. Students
+    match /students/{studentId} {
+      allow get: if isVerified() && (isSuperAdmin() || belongsToUserTenant(existing()) || existing().email == request.auth.token.email);
+      allow list: if isVerified() && (isSuperAdmin() || isTenantStaff()) && belongsToUserTenant(existing()); // Note: list check uses existing()
+      allow create: if isTenantAdmin() && isValidStudent(incoming()) && incoming().tenantId == userTenantId();
+      allow update: if (isTenantAdmin() && belongsToUserTenant(existing()) && isValidStudent(incoming())) || (
+        isVerified() && belongsToUserTenant(existing()) && existing().email == request.auth.token.email &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['phone', 'address', 'birthDate']) &&
+        isValidStudent(incoming())
+      );
+      allow delete: if isSuperAdmin();
+    }
+
+    // 4. Classes
+    match /classes/{classId} {
+      allow read: if isVerified() && belongsToUserTenant(existing());
+      allow create: if isTenantStaff() && isValidClass(incoming()) && incoming().tenantId == userTenantId();
+      allow update: if isTenantStaff() && belongsToUserTenant(existing()) && isValidClass(incoming());
+      allow delete: if isTenantAdmin() && belongsToUserTenant(existing());
+    }
+
+    // 5. Payments
+    match /payments/{paymentId} {
+      allow read: if isVerified() && (isTenantStaff() && belongsToUserTenant(existing())) || (existing().get('studentEmail', '') == request.auth.token.email);
+      allow create: if isTenantAdmin() && isValidPayment(incoming()) && incoming().tenantId == userTenantId();
+      allow update: if isTenantAdmin() && belongsToUserTenant(existing()) && isValidPayment(incoming()) && 
+                    existing().get('status', 'Open') != 'Paid'; // Terminal state lock
+      allow delete: if isSuperAdmin();
+    }
+
+    // 6. Graduations
+    match /graduations/{gradId} {
+      allow read: if isVerified() && (isTenantStaff() && belongsToUserTenant(existing())) || (existing().get('studentEmail', '') == request.auth.token.email);
+      allow create: if isProfessor() && isValidGraduation(incoming()) && incoming().tenantId == userTenantId();
+      allow update: if isProfessor() && belongsToUserTenant(existing()) && isValidGraduation(incoming());
+      allow delete: if isTenantAdmin();
+    }
+
+    // 7. Generic Tenant Collections
+    match /{collectionName}/{docId} {
+      allow read: if isVerified() && belongsToUserTenant(existing());
+      allow write: if isTenantAdmin() && (incoming().get('tenantId', '') == userTenantId() || belongsToUserTenant(existing()));
+      
+      // Prevent unauthorized access to sensitive collections
+      match /secret_settings/{sid} {
+        allow read, write: if isSuperAdmin();
+      }
+      match /licenses/{lid} {
+        allow read: if true; // Public for domain check
+        allow write: if isSuperAdmin();
+      }
+    }
+  }
+}

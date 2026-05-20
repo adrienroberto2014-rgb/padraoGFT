@@ -1,0 +1,284 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // 0. Global Safety Net & Default Deny
+    // ===============================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // Phase 3: Global Helpers (Standard Primitives)
+    // ===============================================================
+    function isSignedIn() { return request.auth != null; }
+    function isVerified() { return isSignedIn(); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    
+    // Super Admin list (Bootstrapped)
+    function isSuperAdmin() {
+      return isSignedIn() && 
+             request.auth.token.email.lower() in [
+               "rodrigues.ueslei@gmail.com",
+               "rodrigues.ueslei02@gmail.com",
+               "ueslei.rodrigues@gmail.com",
+               "adrienroberto2014@gmail.com",
+               "balcaogfteamlimeira@gmail.com"
+             ];
+    }
+
+    // RBAC lookups (Cached per request)
+    function hasLicense() {
+      return isSignedIn() && 
+             exists(/databases/$(database)/documents/licenses/$(request.auth.token.get('email', 'not_set').lower()));
+    }
+
+    function getLicense() {
+      return get(/databases/$(database)/documents/licenses/$(request.auth.token.get('email', 'not_set').lower())).data;
+    }
+
+    function getUser() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function hasUserDoc() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function userTenantId() {
+      return hasUserDoc() ? getUser().get('tenantId', 'default_gym') : 
+             (hasLicense() ? getLicense().get('slug', 'default_gym') : 'default_gym');
+    }
+
+    function userRole() {
+      return hasUserDoc() ? getUser().get('role', 'user') : 
+             (hasLicense() ? 'admin' : (isSuperAdmin() ? 'admin' : 'user'));
+    }
+
+    function isApprovedUser() {
+      return isSuperAdmin() || (isVerified() && hasUserDoc() && getUser().get('approved', false) == true);
+    }
+
+    // Tiered Identity Logic (Pillar 4)
+    function isCheckInTablet() {
+      return isSignedIn() && 
+             request.auth.token.get('email', '').lower() == "balcaogfteamlimeira@gmail.com";
+    }
+
+    function isTenantAdmin() {
+      return isSuperAdmin() || (isVerified() && (
+        (hasUserDoc() && userRole() in ['admin', 'tenant_admin']) ||
+        hasLicense()
+      ));
+    }
+
+    function isTenantStaff() {
+      return isSuperAdmin() || (isVerified() && (
+        (hasUserDoc() && userRole() in ['admin', 'tenant_admin', 'receptionist', 'professor', 'checkin_tablet']) ||
+        hasLicense() ||
+        isCheckInTablet()
+      ));
+    }
+
+    function isProfessor() {
+      return isSuperAdmin() || (isVerified() && (
+        (hasUserDoc() && userRole() == 'professor') ||
+        (hasLicense() && getLicense().get('role', '') == 'professor')
+      ));
+    }
+
+    function belongsToUserTenant(data) {
+      return isSuperAdmin() || (isVerified() && (
+        (hasUserDoc() && data.get('tenantId', '') == userTenantId()) ||
+        (hasLicense() && data.get('tenantId', '') == getLicense().get('slug', ''))
+      ));
+    }
+
+    // Relational Identity (Pillar 1)
+    function isOwnerOfStudent(studentId) {
+      return exists(/databases/$(database)/documents/students/$(studentId)) && 
+             get(/databases/$(database)/documents/students/$(studentId)).data.get('email', '') == request.auth.token.get('email', 'not_set');
+    }
+
+    // ===============================================================
+    // Validation Blueprints (Pillar 2 & 5)
+    // ===============================================================
+
+    function isValidTimestamp(ts) {
+      return ts == request.time;
+    }
+
+    function commonValid(data) {
+      return data.get('tenantId', '') is string && data.get('tenantId', '').size() > 0;
+    }
+
+    function isValidStudent(data) {
+      return commonValid(data) &&
+             data.keys().hasAll(['name', 'email', 'belt', 'status', 'category', 'tenantId']) &&
+             data.get('name', '') is string && data.get('name', '').size() <= 200 &&
+             data.get('email', '') is string && data.get('email', '').size() <= 200 &&
+             data.get('status', '') in ["Active", "Inactive", "Archived"] &&
+             data.get('category', '') in ["Adulto", "Kids", "Juvenil"] &&
+             data.get('belt', '') in ["Branca", "Azul", "Roxa", "Marrom", "Preta", "Cinza", "Amarela", "Laranja", "Verde"];
+    }
+
+    function isValidClass(data) {
+      return commonValid(data) &&
+             data.keys().hasAll(['title', 'startTime', 'endTime', 'tenantId']) &&
+             data.get('title', '') is string && data.get('title', '').size() <= 200;
+    }
+
+    function isValidPayment(data) {
+      return commonValid(data) &&
+             data.keys().hasAll(['studentId', 'amount', 'date', 'period', 'tenantId']) &&
+             data.get('amount', 0) is number && data.get('amount', 0) >= 0;
+    }
+
+    function isValidGraduation(data) {
+      return commonValid(data) &&
+             data.keys().hasAll(['studentId', 'belt', 'stripes', 'date', 'tenantId']) &&
+             data.get('stripes', 0) is number && data.get('stripes', 0) >= 0 && data.get('stripes', 0) <= 4 &&
+             data.get('belt', '') in ["Branca", "Azul", "Roxa", "Marrom", "Preta", "Cinza", "Amarela", "Laranja", "Verde"];
+    }
+
+    function isValidUser(data) {
+      return commonValid(data) &&
+             (!('role' in data) || (data.role is string && data.role.size() > 0)) &&
+             (!('studentId' in data) || (data.studentId == '' || data.studentId is string));
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // --- Core Tenant ---
+    match /tenants/{tenantId} {
+      allow read: if isVerified() && (isSuperAdmin() || tenantId == userTenantId());
+      allow write: if isSuperAdmin();
+    }
+
+    // --- Users ---
+    match /users/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isSuperAdmin() || isTenantStaff());
+      allow list: if isSignedIn() && (isSuperAdmin() || isTenantStaff());
+      allow create: if isSuperAdmin() || (
+        isValidUser(incoming()) && (
+          (isSignedIn() && request.auth.uid == userId) || 
+          (isTenantAdmin() && incoming().tenantId == userTenantId())
+        )
+      );
+      allow update: if isSuperAdmin() || (
+        isValidUser(incoming()) && (
+          (isVerified() && request.auth.uid == userId) || 
+          (isTenantAdmin() && belongsToUserTenant(existing()))
+        ) && (
+          (request.auth.uid == userId && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'email', 'updatedAt', 'id', 'tenantId'])) ||
+          (isTenantAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['role', 'approved', 'studentId', 'updatedAt', 'id', 'tenantId']))
+        )
+      );
+      allow delete: if isSuperAdmin() || (isSignedIn() && request.auth.uid == userId) || (isTenantAdmin() && belongsToUserTenant(existing()));
+    }
+
+    match /licenses/{lid} {
+      allow get, list: if true; 
+      allow write: if isSuperAdmin();
+    }
+
+    // --- Secret Settings ---
+    match /secret_settings/{sid} {
+      allow read: if isSuperAdmin() || (isTenantAdmin() && (existing() == null || belongsToUserTenant(existing())));
+      allow create: if isSuperAdmin() || (isTenantAdmin() && incoming().get('tenantId', '') == userTenantId());
+      allow update, delete: if isSuperAdmin() || (isTenantAdmin() && belongsToUserTenant(existing()));
+    }
+
+    // --- Roles ---
+    match /roles/{roleId} {
+      allow read: if isVerified() && (existing() == null || belongsToUserTenant(existing()));
+      allow create: if isTenantAdmin() && incoming().get('tenantId', '') == userTenantId();
+      allow update, delete: if isTenantAdmin() && belongsToUserTenant(existing());
+    }
+
+    // --- Students ---
+    match /students/{studentId} {
+      allow get: if isApprovedUser() && (isSuperAdmin() || belongsToUserTenant(existing()) || 
+                  existing().get('email', '') == request.auth.token.email || 
+                  getUser().get('studentId', '') == studentId);
+      allow list: if isApprovedUser() && (isSuperAdmin() || isTenantStaff() || 
+                  resource.data.email == request.auth.token.email || 
+                  getUser().get('studentId', '') == resource.id) && (isSuperAdmin() || belongsToUserTenant(existing()));
+      allow create: if isApprovedUser() && isTenantAdmin() && isValidStudent(incoming()) && incoming().tenantId == userTenantId();
+      allow update: if isApprovedUser() && isValidStudent(incoming()) && (
+        (isTenantAdmin() && belongsToUserTenant(existing())) || (
+          isApprovedUser() && belongsToUserTenant(existing()) && existing().get('email', '') == request.auth.token.email &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['phone', 'address', 'birthDate', 'updatedAt'])
+        )
+      );
+      allow delete: if isApprovedUser() && isSuperAdmin();
+    }
+
+    // --- Classes ---
+    match /classes/{classId} {
+      allow read: if isApprovedUser() && belongsToUserTenant(existing());
+      allow create: if isApprovedUser() && isTenantStaff() && isValidClass(incoming()) && incoming().tenantId == userTenantId();
+      allow update: if isApprovedUser() && isValidClass(incoming()) && isTenantStaff() && belongsToUserTenant(existing());
+      allow delete: if isApprovedUser() && isTenantAdmin() && belongsToUserTenant(existing());
+    }
+
+    // --- Payments & Financials ---
+    match /payments/{paymentId} {
+      allow read: if isApprovedUser() && ((isTenantStaff() && belongsToUserTenant(existing())) || (existing().get('studentEmail', '') == request.auth.token.email));
+      allow create: if isApprovedUser() && isTenantAdmin() && isValidPayment(incoming()) && incoming().tenantId == userTenantId();
+      allow update: if isApprovedUser() && isValidPayment(incoming()) && isTenantAdmin() && belongsToUserTenant(existing()) && 
+                    existing().get('status', 'Open') != 'Paid'; // Terminal state lock
+      allow delete: if isApprovedUser() && isSuperAdmin();
+    }
+
+    match /expenses/{expenseId} {
+      allow read, write: if isTenantAdmin() && (isSuperAdmin() || (hasUserDoc() && belongsToUserTenant(existing() == null ? incoming() : existing())));
+    }
+
+    // --- Graduations & Evaluations ---
+    match /graduations/{gradId} {
+      allow read: if isVerified() && (isTenantStaff() && belongsToUserTenant(existing())) || (existing().get('studentEmail', '') == request.auth.token.email);
+      allow create: if isProfessor() && isValidGraduation(incoming()) && incoming().tenantId == userTenantId();
+      allow update: if isValidGraduation(incoming()) && isProfessor() && belongsToUserTenant(existing());
+      allow delete: if isTenantAdmin();
+    }
+
+    match /evaluations/{evalId} {
+      allow read: if isVerified() && (isTenantStaff() && belongsToUserTenant(existing())) || (existing().get('studentEmail', '') == request.auth.token.email);
+      allow create: if isProfessor() && incoming().tenantId == userTenantId();
+      allow update, delete: if isProfessor() && belongsToUserTenant(existing());
+    }
+
+    // --- Inventory & Sales ---
+    match /products/{prodId} {
+      allow read: if isVerified() && belongsToUserTenant(existing());
+      allow create: if isTenantAdmin() && incoming().get('tenantId', '') == userTenantId();
+      allow update, delete: if isTenantAdmin() && belongsToUserTenant(existing());
+    }
+
+    match /sales/{saleId} {
+      allow read: if isVerified() && (isTenantStaff() && belongsToUserTenant(existing())) || (existing().get('studentEmail', '') == request.auth.token.email);
+      allow create: if isTenantStaff() && incoming().tenantId == userTenantId();
+      allow update: if isTenantAdmin() && belongsToUserTenant(existing());
+    }
+
+    // --- Settings & Metadata ---
+    match /settings/{sid} {
+      allow read: if isVerified() && belongsToUserTenant(existing());
+      allow create: if isTenantAdmin() && incoming().get('tenantId', '') == userTenantId();
+      allow update, delete: if isTenantAdmin() && belongsToUserTenant(existing());
+    }
+
+    // --- Catch-all fallback for other tenant-specific entities ---
+    match /{collectionName}/{docId} {
+      allow read: if !(collectionName in ['licenses', 'users', 'roles']) && isVerified() && belongsToUserTenant(existing());
+      allow create: if !(collectionName in ['licenses', 'users', 'roles']) && isTenantStaff() && incoming().get('tenantId', '') == userTenantId();
+      allow update, delete: if !(collectionName in ['licenses', 'users', 'roles']) && isTenantAdmin() && belongsToUserTenant(existing());
+    }
+  }
+}
